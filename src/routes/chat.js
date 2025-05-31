@@ -21,8 +21,8 @@ function processParameters(body) {
     processed.top_p = Math.round((Math.random() * 0.1 + 0.8) * 100) / 100 // 0.8-0.9之间，保留两位小数
   }
   
-  // 处理max_tokens参数：如果小于4096或大于16384或不存在，则默认16384
-  if (!processed.max_tokens || processed.max_tokens < 4096 || processed.max_tokens > 16384) {
+  // 处理max_tokens参数：如果小于8192或大于16384或不存在，则默认16384
+  if (!processed.max_tokens || processed.max_tokens < 8192 || processed.max_tokens > 16384) {
     processed.max_tokens = 16384
   }
   
@@ -212,11 +212,11 @@ async function getChatID(req, res) {
       }
     }
 
-    // 确保budget_tokens不超过max_tokens
-    if (data.prompt_blueprint.metadata.model.parameters.max_tokens && 
-        data.prompt_blueprint.metadata.model.parameters.thinking?.budget_tokens && 
-        data.prompt_blueprint.metadata.model.parameters.max_tokens < data.prompt_blueprint.metadata.model.parameters.thinking.budget_tokens) {
-      data.prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = data.prompt_blueprint.metadata.model.parameters.max_tokens
+    // 如果模型有thinking参数，将budget_tokens设置为max_tokens的1/4
+    if (data.prompt_blueprint.metadata.model.parameters.thinking && 
+        data.prompt_blueprint.metadata.model.parameters.max_tokens) {
+      data.prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = 
+        Math.floor(data.prompt_blueprint.metadata.model.parameters.max_tokens / 4)
     }
     
     console.log("模型参数 => ", data.prompt_blueprint.metadata.model)
@@ -281,11 +281,11 @@ async function sentRequest(req, res) {
       }
     }
     
-    // 确保budget_tokens不超过max_tokens
-    if (data.shared_prompt_blueprint.metadata.model.parameters.max_tokens && 
-        data.shared_prompt_blueprint.metadata.model.parameters.thinking?.budget_tokens && 
-        data.shared_prompt_blueprint.metadata.model.parameters.max_tokens < data.shared_prompt_blueprint.metadata.model.parameters.thinking.budget_tokens) {
-      data.shared_prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = data.shared_prompt_blueprint.metadata.model.parameters.max_tokens
+    // 如果模型有thinking参数，将budget_tokens设置为max_tokens的1/4
+    if (data.shared_prompt_blueprint.metadata.model.parameters.thinking && 
+        data.shared_prompt_blueprint.metadata.model.parameters.max_tokens) {
+      data.shared_prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = 
+        Math.floor(data.shared_prompt_blueprint.metadata.model.parameters.max_tokens / 4)
     }
 
     const response = await axios.post(url, data, { headers })
