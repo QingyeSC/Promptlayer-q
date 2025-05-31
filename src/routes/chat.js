@@ -372,8 +372,34 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
     ws.on('message', async (data) => {
       try {
         data = data.toString()
-        let ContentText = JSON.parse(data)?.messages?.[0]
-        let ContentData = JSON.parse(ContentText?.data)
+        
+        // 检查数据是否为空或无效
+        if (!data || data === 'undefined' || data.trim() === '') {
+          console.log('收到空或无效的WebSocket消息，跳过处理')
+          return
+        }
+        
+        let parsedData
+        try {
+          parsedData = JSON.parse(data)
+        } catch (parseError) {
+          console.log('WebSocket消息JSON解析失败，原始数据:', data)
+          return
+        }
+        
+        let ContentText = parsedData?.messages?.[0]
+        if (!ContentText?.data) {
+          return
+        }
+        
+        let ContentData
+        try {
+          ContentData = JSON.parse(ContentText.data)
+        } catch (parseError) {
+          console.log('ContentText.data JSON解析失败:', ContentText.data)
+          return
+        }
+        
         const isRequestID = ContentData?.individual_run_request_id
         if (isRequestID != RequestID || !isRequestID) return
 
@@ -480,7 +506,10 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
         }
 
       } catch (err) {
-        console.error("处理WebSocket消息出错:", err)
+        // 只记录非JSON解析错误
+        if (!(err instanceof SyntaxError && err.message.includes('JSON'))) {
+          console.error("处理WebSocket消息出错:", err)
+        }
       }
     })
 
