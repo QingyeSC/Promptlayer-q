@@ -7,6 +7,83 @@ const { uploadFileBuffer } = require('../lib/upload')
 const verify = require('./verify')
 const modelMap = require('../lib/model-map')
 
+// 参数处理工具函数
+function processParameters(body) {
+  const processed = { ...body }
+  
+  // 处理temperature参数：如果大于1或小于等于0或不存在，则随机取0.8-0.9之间的值
+  if (!processed.temperature || processed.temperature <= 0 || processed.temperature > 1) {
+    processed.temperature = Math.round((Math.random() * 0.1 + 0.8) * 100) / 100 // 0.8-0.9之间，保留两位小数
+  }
+  
+  // 处理top_p参数：如果大于1或小于等于0或不存在，则随机取0.8-0.9之间的值
+  if (!processed.top_p || processed.top_p <= 0 || processed.top_p > 1) {
+    processed.top_p = Math.round((Math.random() * 0.1 + 0.8) * 100) / 100 // 0.8-0.9之间，保留两位小数
+  }
+  
+  // 处理max_tokens参数：如果小于4096或大于16384或不存在，则默认16384
+  if (!processed.max_tokens || processed.max_tokens < 4096 || processed.max_tokens > 16384) {
+    processed.max_tokens = 16384
+  }
+  
+  return processed
+}
+
+// 错误处理工具函数
+function handleError(res, error, context = '服务器内部错误') {
+  console.error(`${context}:`, error)
+  
+  // 如果有响应状态码，使用原始状态码
+  const statusCode = error.response?.status || 500
+  
+  // 尝试获取上游的原始错误信息
+  let errorMessage = context
+  let errorType = 'server_error'
+  let errorCode = 'server_error'
+  
+  if (error.response?.data) {
+    // 如果上游返回了结构化的错误信息
+    if (error.response.data.error) {
+      errorMessage = error.response.data.error.message || error.response.data.error
+      errorType = error.response.data.error.type || 'upstream_error'
+      errorCode = error.response.data.error.code || 'upstream_error'
+    } else if (typeof error.response.data === 'string') {
+      errorMessage = error.response.data
+      errorType = 'upstream_error'
+      errorCode = 'upstream_error'
+    } else {
+      errorMessage = JSON.stringify(error.response.data)
+      errorType = 'upstream_error'
+      errorCode = 'upstream_error'
+    }
+  } else if (error.message) {
+    errorMessage = error.message
+  }
+  
+  // 根据状态码设置错误类型
+  if (statusCode === 401) {
+    errorType = 'authentication_error'
+    errorCode = 'invalid_api_key'
+  } else if (statusCode === 403) {
+    errorType = 'permission_error'
+    errorCode = 'forbidden'
+  } else if (statusCode === 429) {
+    errorType = 'rate_limit_error'
+    errorCode = 'rate_limit_exceeded'
+  } else if (statusCode === 503) {
+    errorType = 'service_unavailable'
+    errorCode = 'service_unavailable'
+  }
+  
+  return res.status(statusCode).json({
+    "error": {
+      "message": errorMessage,
+      "type": errorType,
+      "param": null,
+      "code": errorCode
+    }
+  })
+}
 
 async function parseMessages(req, res, next) {
   const messages = req.body.messages
@@ -88,7 +165,7 @@ async function parseMessages(req, res, next) {
     req.body.messages = transformedMessages
     return next()
   } catch (error) {
-    console.error("处理消息时出错:", error.status)
+    console.error("处理消息时出错:", error)
     req.body.messages = []
     return next(error)
   }
@@ -99,19 +176,23 @@ async function getChatID(req, res) {
     const url = 'https://api.promptlayer.com/api/dashboard/v2/workspaces/' + req.account.workspaceId + '/playground_sessions'
     const headers = { Authorization: "Bearer " + req.account.token }
     const model_data = modelMap[req.body.model] ? modelMap[req.body.model] : modelMap["claude-3-7-sonnet-20250219"]
+    
+    // 处理请求参数
+    const processedBody = processParameters(req.body)
+    
     let data = {
       "id": uuidv4(),
       "name": "Not implemented",
       "prompt_blueprint": {
         "inference_client_name": null,
         "metadata": {
-          "model": model_data
+          "model": { ...model_data }
         },
         "prompt_template": {
           "type": "chat",
-          "messages": req.body.messages,
-          "tools": req.body.tools || null,
-          "tool_choice": req.body.tool_choice || null,
+          "messages": processedBody.messages,
+          "tools": processedBody.tools || null,
+          "tool_choice": processedBody.tool_choice || null,
           "input_variables": [],
           "functions": [],
           "function_call": null
@@ -121,19 +202,23 @@ async function getChatID(req, res) {
       "input_variables": []
     }
 
-    for (const item in req.body) {
+    // 应用处理后的参数到模型配置
+    for (const item in processedBody) {
       if (item === "messages" || item === "model" || item === "stream") {
         continue
-      } else if (model_data.parameters[item]) {
-        if (item === "thinking" && req.body[item].type === "disabled") { continue }
-        model_data.parameters[item] = req.body[item]
+      } else if (data.prompt_blueprint.metadata.model.parameters[item] !== undefined) {
+        if (item === "thinking" && processedBody[item].type === "disabled") { continue }
+        data.prompt_blueprint.metadata.model.parameters[item] = processedBody[item]
       }
     }
 
-    data.prompt_blueprint.metadata.model = model_data
-    if (model_data.parameters.max_tokens && model_data.parameters.thinking?.budget_tokens && model_data.parameters.max_tokens < model_data.parameters.thinking.budget_tokens) {
-      data.prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = model_data.parameters.max_tokens
+    // 确保budget_tokens不超过max_tokens
+    if (data.prompt_blueprint.metadata.model.parameters.max_tokens && 
+        data.prompt_blueprint.metadata.model.parameters.thinking?.budget_tokens && 
+        data.prompt_blueprint.metadata.model.parameters.max_tokens < data.prompt_blueprint.metadata.model.parameters.thinking.budget_tokens) {
+      data.prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = data.prompt_blueprint.metadata.model.parameters.max_tokens
     }
+    
     console.log("模型参数 => ", data.prompt_blueprint.metadata.model)
 
     const response = await axios.put(url, data, { headers })
@@ -142,19 +227,11 @@ async function getChatID(req, res) {
       req.chatID = response.data.playground_session.id
       return response.data.playground_session.id
     } else {
-      return false
+      throw new Error(response.data.message || '获取会话ID失败')
     }
   } catch (error) {
-    // console.error("错误:", error.response?.data)
-    res.status(500).json({
-      "error": {
-        "message": error.message || "服务器内部错误",
-        "type": "server_error",
-        "param": null,
-        "code": "server_error"
-      }
-    })
-    return false
+    console.error("获取会话ID失败:", error)
+    throw error
   }
 }
 
@@ -163,19 +240,23 @@ async function sentRequest(req, res) {
     const url = 'https://api.promptlayer.com/api/dashboard/v2/workspaces/' + req.account.workspaceId + '/run_groups'
     const headers = { Authorization: "Bearer " + req.account.token }
     const model_data = modelMap[req.body.model] ? modelMap[req.body.model] : modelMap["claude-3-7-sonnet-20250219"]
+    
+    // 处理请求参数
+    const processedBody = processParameters(req.body)
+    
     let data = {
       "id": uuidv4(),
       "playground_session_id": req.chatID,
       "shared_prompt_blueprint": {
         "inference_client_name": null,
         "metadata": {
-          "model": model_data
+          "model": { ...model_data }
         },
         "prompt_template": {
           "type": "chat",
-          "messages": req.body.messages,
-          "tools": req.body.tools || null,
-          "tool_choice": req.body.tool_choice || null,
+          "messages": processedBody.messages,
+          "tools": processedBody.tools || null,
+          "tool_choice": processedBody.tool_choice || null,
           "input_variables": [],
           "functions": [],
           "function_call": null
@@ -190,35 +271,32 @@ async function sentRequest(req, res) {
       ]
     }
 
-    for (const item in req.body) {
+    // 应用处理后的参数到模型配置
+    for (const item in processedBody) {
       if (item === "messages" || item === "model" || item === "stream") {
         continue
-      } else if (model_data.parameters[item]) {
-        if (item === "thinking" && req.body[item].type === "disabled") continue
-        model_data.parameters[item] = req.body[item]
+      } else if (data.shared_prompt_blueprint.metadata.model.parameters[item] !== undefined) {
+        if (item === "thinking" && processedBody[item].type === "disabled") continue
+        data.shared_prompt_blueprint.metadata.model.parameters[item] = processedBody[item]
       }
     }
-    data.shared_prompt_blueprint.metadata.model = model_data
-    if (model_data.parameters.max_tokens && model_data.parameters.thinking?.budget_tokens && model_data.parameters.max_tokens < model_data.parameters.thinking.budget_tokens) {
-      data.prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = model_data.parameters.max_tokens
+    
+    // 确保budget_tokens不超过max_tokens
+    if (data.shared_prompt_blueprint.metadata.model.parameters.max_tokens && 
+        data.shared_prompt_blueprint.metadata.model.parameters.thinking?.budget_tokens && 
+        data.shared_prompt_blueprint.metadata.model.parameters.max_tokens < data.shared_prompt_blueprint.metadata.model.parameters.thinking.budget_tokens) {
+      data.shared_prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = data.shared_prompt_blueprint.metadata.model.parameters.max_tokens
     }
 
     const response = await axios.post(url, data, { headers })
     if (response.data.success) {
       return response.data.run_group.individual_run_requests[0].id
     } else {
-      return false
+      throw new Error(response.data.message || '发送请求失败')
     }
   } catch (error) {
-    // console.error("错误:", error.response?.data)
-    res.status(500).json({
-      "error": {
-        "message": error.message || "服务器内部错误",
-        "type": "server_error",
-        "param": null,
-        "code": "server_error"
-      }
-    })
+    console.error("发送请求失败:", error)
+    throw error
   }
 }
 
@@ -236,13 +314,18 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
           res.setHeader('Content-Type', 'application/json')
         }
       } catch (error) {
-        // console.error("设置响应头时出错:", error)
+        console.error("设置响应头时出错:", error)
       }
     }
 
     const { access_token, clientId } = req.account
+    
     // 生成会话ID
-    await getChatID(req, res)
+    try {
+      await getChatID(req, res)
+    } catch (error) {
+      return handleError(res, error, '获取会话ID失败')
+    }
 
     // 发送的数据
     const sendAction = `{"action":10,"channel":"user:${clientId}","params":{"agent":"react-hooks/2.0.2"}}`
@@ -276,15 +359,19 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
     }
 
     ws.on('open', async () => {
-      ws.send(sendAction)
-      RequestID = await sentRequest(req, res)
-      setHeader()
+      try {
+        ws.send(sendAction)
+        RequestID = await sentRequest(req, res)
+        setHeader()
+      } catch (error) {
+        ws.close()
+        return handleError(res, error, '发送请求失败')
+      }
     })
 
     ws.on('message', async (data) => {
       try {
         data = data.toString()
-        // console.log(JSON.parse(data))
         let ContentText = JSON.parse(data)?.messages?.[0]
         let ContentData = JSON.parse(ContentText?.data)
         const isRequestID = ContentData?.individual_run_request_id
@@ -327,10 +414,18 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
             output = ThinkingLastContent ? `<think>\n\n${ThinkingLastContent}\n\n</think>\n\n${TextLastContent}` : TextLastContent
           }
 
+          // 检查是否为空回复或错误
           if (ThinkingLastContent === "" && TextLastContent === "") {
-            output = "该模型在发送请求时遇到错误: \n1. 请检查请求参数,模型支持参数和默认参数可在/v1/models下查看\n2. 参数设置大小是否超过模型限制\n3. 模型当前官网此模型可能负载过高,可以切换别的模型尝试,这属于正常现象\n4. Anthropic系列模型的temperature的取值为0-1,请勿设置超过1的值,思考模型的 budget_tokens 不可小于 max_tokens \n5. 交流与支持群: https://t.me/nodejs_project"
-            streamChunk.choices[0].delta.content = output
-            res.write(`data: ${JSON.stringify(streamChunk)}\n\n`)
+            // 返回502错误，表示上游服务问题
+            ws.close()
+            return res.status(502).json({
+              "error": {
+                "message": "上游服务返回空响应或发生错误",
+                "type": "upstream_error",
+                "param": null,
+                "code": "empty_response"
+              }
+            })
           }
 
           if (!req.body.stream || req.body.stream !== true) {
@@ -385,33 +480,26 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
         }
 
       } catch (err) {
-        // console.error("处理WebSocket消息出错:", err)
+        console.error("处理WebSocket消息出错:", err)
       }
     })
 
     ws.on('error', (err) => {
-      // 标准OpenAI错误响应格式
-      res.status(500).json({
-        "error": {
-          "message": err.message,
-          "type": "server_error",
-          "param": null,
-          "code": "server_error"
-        }
-      })
+      console.error("WebSocket连接错误:", err)
+      return handleError(res, err, 'WebSocket连接失败')
     })
 
     setTimeout(() => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.close()
         if (!res.headersSent) {
-          // 标准OpenAI超时错误响应格式
+          // 返回504超时错误
           res.status(504).json({
             "error": {
               "message": "请求超时",
-              "type": "timeout",
+              "type": "timeout_error",
               "param": null,
-              "code": "timeout_error"
+              "code": "request_timeout"
             }
           })
         }
@@ -419,16 +507,8 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
     }, 300 * 1000)
 
   } catch (error) {
-    console.error("错误:", error)
-    // 标准OpenAI通用错误响应格式
-    res.status(500).json({
-      "error": {
-        "message": error.message || "服务器内部错误",
-        "type": "server_error",
-        "param": null,
-        "code": "server_error"
-      }
-    })
+    console.error("聊天处理错误:", error)
+    return handleError(res, error, '聊天服务错误')
   }
 })
 
