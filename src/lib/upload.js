@@ -7,12 +7,12 @@ const imageCache = require('./caches')
 async function uploadFileBuffer(fileBuffer, account) {
   try {
     // 检查account是否存在
-    if (!account || !account.token) {
+    if (!account || !account.access_token) {
       console.error('无效的账户信息')
       return { success: false, error: '账户信息无效' }
     }
     
-    const authToken = account.token
+    const authToken = account.access_token  // 使用正确的 access_token
     
     // 转换为base64用于缓存检查
     const base64Data = fileBuffer.toString('base64')

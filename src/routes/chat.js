@@ -10,7 +10,7 @@ const verify = require('./verify')
 const modelMap = require('../lib/model-map')
 const wsPool = require('../lib/websocket-pool')
 
-// 参数处理工具函数 (保持不变)
+// 参数处理工具函数
 function processParameters(body) {
   const processed = { ...body }
   
@@ -29,7 +29,7 @@ function processParameters(body) {
   return processed
 }
 
-// 错误处理工具函数 (保持不变)
+// 错误处理工具函数
 function handleError(res, error, context = '服务器内部错误') {
   console.error(`${context}:`, error)
   
@@ -80,7 +80,7 @@ function handleError(res, error, context = '服务器内部错误') {
   })
 }
 
-// 消息解析中间件 (保持不变)
+// 消息解析中间件
 async function parseMessages(req, res, next) {
   const messages = req.body.messages
   if (!Array.isArray(messages)) {
@@ -167,14 +167,14 @@ async function parseMessages(req, res, next) {
   }
 }
 
-// 获取聊天ID (保持不变，但添加重试机制)
+// 获取聊天ID
 async function getChatID(req, res) {
   const maxRetries = 3
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       const url = 'https://api.promptlayer.com/api/dashboard/v2/workspaces/' + req.account.workspaceId + '/playground_sessions'
-      const headers = { Authorization: "Bearer " + req.account.token }
+      const headers = { Authorization: "Bearer " + req.account.access_token }  // 使用官方 API 密钥
       const model_data = modelMap[req.body.model] ? modelMap[req.body.model] : modelMap["claude-3-7-sonnet-20250219"]
       
       const processedBody = processParameters(req.body)
@@ -243,14 +243,14 @@ async function getChatID(req, res) {
   }
 }
 
-// 发送请求 (保持不变，但添加重试机制)
+// 发送请求
 async function sentRequest(req, res) {
   const maxRetries = 3
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       const url = 'https://api.promptlayer.com/api/dashboard/v2/workspaces/' + req.account.workspaceId + '/run_groups'
-      const headers = { Authorization: "Bearer " + req.account.token }
+      const headers = { Authorization: "Bearer " + req.account.access_token }  // 使用官方 API 密钥
       const model_data = modelMap[req.body.model] ? modelMap[req.body.model] : modelMap["claude-3-7-sonnet-20250219"]
       
       const processedBody = processParameters(req.body)

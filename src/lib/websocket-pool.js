@@ -72,8 +72,8 @@ class WebSocketPool extends EventEmitter {
   // 创建新的 WebSocket 连接
   createConnection(userAccount, userPool) {
     return new Promise((resolve, reject) => {
-      const { access_token, clientId } = userAccount
-      const wsUrl = `wss://realtime.ably.io/?access_token=${encodeURIComponent(access_token)}&clientId=${clientId}&format=json&heartbeats=true&v=3&agent=ably-js%2F2.0.2%20browser`
+      const { ws_token, clientId } = userAccount
+      const wsUrl = `wss://realtime.ably.io/?access_token=${encodeURIComponent(ws_token)}&clientId=${clientId}&format=json&heartbeats=true&v=3&agent=ably-js%2F2.0.2%20browser`
       
       const ws = new WebSocket(wsUrl)
       const connectionId = `${clientId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`

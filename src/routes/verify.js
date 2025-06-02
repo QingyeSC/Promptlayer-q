@@ -14,11 +14,11 @@ const verify = async (req, res, next) => {
     })
   }
 
-  const token = authorization.replace('Bearer ', '')
+  const access_token = authorization.replace('Bearer ', '')
 
   try {
-    // 验证用户的 PromptLayer token 是否有效
-    const userInfo = await validatePromptLayerToken(token)
+    // 验证用户的 PromptLayer access_token 是否有效
+    const userInfo = await validatePromptLayerToken(access_token)
     if (!userInfo) {
       return res.status(401).json({ 
         error: {
@@ -30,8 +30,8 @@ const verify = async (req, res, next) => {
       })
     }
 
-    // 获取用户的工作空间和访问令牌
-    const accountInfo = await getAccountInfo(token)
+    // 获取用户的工作空间和WebSocket访问令牌
+    const accountInfo = await getAccountInfo(access_token)
     if (!accountInfo) {
       return res.status(503).json({ 
         error: {
@@ -45,8 +45,8 @@ const verify = async (req, res, next) => {
 
     // 将账户信息附加到请求对象
     req.account = {
-      token: token,  // 用户的原始 PromptLayer token
-      access_token: accountInfo.access_token,
+      access_token: access_token,  // 用户的官方 PromptLayer API 密钥
+      ws_token: accountInfo.ws_token,  // WebSocket 临时访问令牌
       clientId: accountInfo.clientId,
       workspaceId: accountInfo.workspaceId,
       username: userInfo.email || '用户'  // 从用户信息获取邮箱
@@ -89,13 +89,13 @@ const verify = async (req, res, next) => {
   }
 }
 
-// 验证 PromptLayer token 有效性并获取用户信息
-async function validatePromptLayerToken(token) {
+// 验证 PromptLayer access_token 有效性并获取用户信息
+async function validatePromptLayerToken(access_token) {
   try {
     // 修正接口地址：从 /user 改为 /get-user
     const response = await axios.get('https://api.promptlayer.com/get-user', {
       headers: {
-        'Authorization': `Bearer ${token}`,
+        'Authorization': `Bearer ${access_token}`,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
       },
       timeout: 10000
@@ -106,18 +106,18 @@ async function validatePromptLayerToken(token) {
     }
     return null
   } catch (error) {
-    console.error('验证PromptLayer token失败:', error.message)
+    console.error('验证PromptLayer access_token失败:', error.message)
     throw error
   }
 }
 
 // 获取用户的账户信息（workspaceId、clientId等）
-async function getAccountInfo(token) {
+async function getAccountInfo(access_token) {
   try {
     // 获取 WebSocket 访问令牌和 clientId
     const wsTokenResponse = await axios.post('https://api.promptlayer.com/ws-token-request', null, {
       headers: {
-        'Authorization': `Bearer ${token}`,
+        'Authorization': `Bearer ${access_token}`,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
       },
       timeout: 10000
@@ -127,12 +127,12 @@ async function getAccountInfo(token) {
       throw new Error('获取WebSocket令牌失败')
     }
 
-    const { token: access_token, clientId } = wsTokenResponse.data.token_details
+    const { token: ws_token, clientId } = wsTokenResponse.data.token_details
 
     // 获取工作空间ID
     const workspacesResponse = await axios.get('https://api.promptlayer.com/workspaces', {
       headers: {
-        'Authorization': `Bearer ${token}`,
+        'Authorization': `Bearer ${access_token}`,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
       },
       timeout: 10000
@@ -145,7 +145,7 @@ async function getAccountInfo(token) {
     const workspaceId = workspacesResponse.data.workspaces[0].id
 
     return {
-      access_token,
+      ws_token,
       clientId,
       workspaceId
     }
