@@ -49,7 +49,7 @@ const verify = async (req, res, next) => {
       ws_token: accountInfo.ws_token,  // WebSocket 临时访问令牌
       clientId: accountInfo.clientId,
       workspaceId: accountInfo.workspaceId,
-      username: userInfo.email || '用户'  // 从用户信息获取邮箱
+      username: userInfo.email || userInfo.name || '用户'  // 从用户信息获取邮箱或名称
     }
 
     console.log(`用户 ${req.account.username} 认证成功`)
@@ -92,7 +92,6 @@ const verify = async (req, res, next) => {
 // 验证 PromptLayer access_token 有效性并获取用户信息
 async function validatePromptLayerToken(access_token) {
   try {
-    // 修正接口地址：从 /user 改为 /get-user
     const response = await axios.get('https://api.promptlayer.com/get-user', {
       headers: {
         'Authorization': `Bearer ${access_token}`,
@@ -101,8 +100,9 @@ async function validatePromptLayerToken(access_token) {
       timeout: 10000
     })
     
-    if (response.data && response.data.success) {
-      return response.data.user
+    // 根据实际返回格式检查：直接返回用户对象，包含 id、email 等字段
+    if (response.data && response.data.id && response.data.email) {
+      return response.data  // 直接返回用户信息对象
     }
     return null
   } catch (error) {
