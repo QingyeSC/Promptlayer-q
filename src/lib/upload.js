@@ -1,32 +1,26 @@
+// src/lib/upload.js
 const axios = require('axios')
 const FormData = require('form-data')
 const imageCache = require('./caches')
-const manager = require('./manager')
 
-
-async function uploadFileBuffer(fileBuffer) {
+// 修改函数签名，接收account参数而不是从manager获取
+async function uploadFileBuffer(fileBuffer, account) {
   try {
-    const account = await manager.getAccount()
-    
     // 检查account是否存在
-    if (!account) {
-      console.error('无法获取有效的账户')
-      return { success: false, error: '账户获取失败' }
+    if (!account || !account.token) {
+      console.error('无效的账户信息')
+      return { success: false, error: '账户信息无效' }
     }
     
     const authToken = account.token
-    
-    // 检查token是否存在
-    if (!authToken) {
-      console.error('无法获取有效的认证token')
-      return { success: false, error: '认证失败' }
-    }
     
     // 转换为base64用于缓存检查
     const base64Data = fileBuffer.toString('base64')
     
     // 检查缓存中是否已存在此图片
-    const cachedUrl = imageCache.getImageUrl(base64Data)
+    // 注意：现在每个用户都有自己的缓存空间，需要按用户区分
+    const cacheKey = `${account.username || 'anonymous'}_${base64Data}`
+    const cachedUrl = imageCache.getImageUrl(cacheKey)
     if (cachedUrl) {
       console.log('使用缓存的图片URL:', cachedUrl)
       return { success: true, file_url: cachedUrl }
@@ -58,7 +52,7 @@ async function uploadFileBuffer(fileBuffer) {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0',
     }
 
-    console.log('开始上传图片，大小:', fileBuffer.length, 'bytes')
+    console.log(`用户 ${account.username} 开始上传图片，大小:`, fileBuffer.length, 'bytes')
 
     // 发送请求
     const response = await axios.post('https://api.promptlayer.com/upload', form, { 
@@ -68,14 +62,16 @@ async function uploadFileBuffer(fileBuffer) {
     
     // 如果上传成功，添加到缓存
     if (response.data && response.data.success && response.data.file_url) {
-      imageCache.addImage(base64Data, response.data.file_url)
-      console.log('图片上传成功:', response.data.file_url)
+      // 按用户区分缓存
+      imageCache.addImage(cacheKey, response.data.file_url)
+      console.log(`用户 ${account.username} 图片上传成功:`, response.data.file_url)
     }
 
     // 返回响应数据
     return response.data
   } catch (error) {
     console.error('图片上传失败:', {
+      user: account?.username || 'unknown',
       status: error.response?.status,
       statusText: error.response?.statusText,
       data: error.response?.data,

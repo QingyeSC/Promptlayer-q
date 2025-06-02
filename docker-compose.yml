@@ -8,9 +8,6 @@ services:
     ports:
       - "5437:3000"
     environment:
-      - ACCOUNTS=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJmcmVzaCI6ZmFsc2UsImlhdCI6MTc0ODQ1ODkwMiwianRpIjoiNWM3YzE1NGQtNjdjNC00ODU5LWEzZjMtNzlkOTRhNWZhNjJjIiwidHlwZSI6ImFjY2VzcyIsInN1YiI6MjI5NTQsIm5iZiI6MTc0ODQ1ODkwMiwiZXhwIjoxNzQ5MDYzNzAyfQ.jZ-WClahhfp_zKWbVdEWS6FKXuVR8JHvx_dQpSg-ZMU
-
-      - AUTH_TOKEN=12345rS@#s
-    
+      - LOG_LEVEL=info   
     volumes:
       - ./logs:/app/logs

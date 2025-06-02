@@ -114,7 +114,7 @@ async function parseMessages(req, res, next) {
               if (base64Match) {
                 const base64 = base64Match[1]
                 const data = Buffer.from(base64, 'base64')
-                const uploadResult = await uploadFileBuffer(data)
+                const uploadResult = await uploadFileBuffer(data, req.account)
 
                 return {
                   type: "media",
