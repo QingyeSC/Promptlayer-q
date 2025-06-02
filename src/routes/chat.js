@@ -1,4 +1,4 @@
-// 优化后的聊天路由，每次创建新的WebSocket连接
+// 优化后的聊天路由，修复流式输出问题
 
 const express = require('express')
 const axios = require('axios')
@@ -31,6 +31,20 @@ function processParameters(body) {
 // 错误处理工具函数
 function handleError(res, error, context = '服务器内部错误') {
   console.error(`${context}:`, error)
+  
+  // 如果响应头已经发送（流式模式），则不能再设置状态码
+  if (res.headersSent) {
+    // 对于流式响应，发送错误消息并结束流
+    try {
+      res.write(`data: {"error": {"message": "${context}", "type": "stream_error"}}\n\n`)
+      res.write(`data: [DONE]\n\n`)
+      res.end()
+    } catch (writeError) {
+      console.error('写入流式错误响应失败:', writeError)
+      res.end()
+    }
+    return
+  }
   
   const statusCode = error.response?.status || 500
   let errorMessage = context
@@ -173,7 +187,7 @@ async function getChatID(req, res) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       const url = 'https://api.promptlayer.com/api/dashboard/v2/workspaces/' + req.account.workspaceId + '/playground_sessions'
-      const headers = { Authorization: "Bearer " + req.account.access_token }  // 使用官方 API 密钥
+      const headers = { Authorization: "Bearer " + req.account.access_token }
       const model_data = modelMap[req.body.model] ? modelMap[req.body.model] : modelMap["claude-3-7-sonnet-20250219"]
       
       const processedBody = processParameters(req.body)
@@ -219,7 +233,7 @@ async function getChatID(req, res) {
 
       const response = await axios.put(url, data, { 
         headers,
-        timeout: 30000 // 30秒超时
+        timeout: 30000
       })
       
       if (response.data.success) {
@@ -236,7 +250,6 @@ async function getChatID(req, res) {
         throw error
       }
       
-      // 指数退避重试
       await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000))
     }
   }
@@ -249,7 +262,7 @@ async function sentRequest(req, res) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       const url = 'https://api.promptlayer.com/api/dashboard/v2/workspaces/' + req.account.workspaceId + '/run_groups'
-      const headers = { Authorization: "Bearer " + req.account.access_token }  // 使用官方 API 密钥
+      const headers = { Authorization: "Bearer " + req.account.access_token }
       const model_data = modelMap[req.body.model] ? modelMap[req.body.model] : modelMap["claude-3-7-sonnet-20250219"]
       
       const processedBody = processParameters(req.body)
@@ -298,7 +311,7 @@ async function sentRequest(req, res) {
 
       const response = await axios.post(url, data, { 
         headers,
-        timeout: 30000 // 30秒超时
+        timeout: 30000
       })
       
       if (response.data.success) {
@@ -313,7 +326,6 @@ async function sentRequest(req, res) {
         throw error
       }
       
-      // 指数退避重试
       await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000))
     }
   }
@@ -330,63 +342,59 @@ function createWebSocketConnection(userAccount) {
     const ws = new WebSocket(wsUrl)
     const connectionId = `${clientId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
     
-    // 连接属性
     ws.connectionId = connectionId
     ws.userId = clientId
     ws.createdAt = Date.now()
 
-    // 连接成功
     ws.on('open', () => {
       console.log(`用户 ${userAccount.username} WebSocket连接已建立: ${connectionId}`)
       
-      // 发送初始连接消息
       const sendAction = `{"action":10,"channel":"user:${clientId}","params":{"agent":"react-hooks/2.0.2"}}`
       ws.send(sendAction)
       
       resolve(ws)
     })
 
-    // 连接错误
     ws.on('error', (error) => {
       console.error(`用户 ${userAccount.username} WebSocket连接错误 ${connectionId}:`, error)
       reject(error)
     })
 
-    // 连接关闭
     ws.on('close', () => {
       console.log(`用户 ${userAccount.username} WebSocket连接已关闭: ${connectionId}`)
     })
 
-    // 连接超时
     setTimeout(() => {
       if (ws.readyState === WebSocket.CONNECTING) {
         ws.close()
         reject(new Error('WebSocket连接超时'))
       }
-    }, 10000) // 10秒连接超时
+    }, 10000)
   })
 }
 
-// 聊天完成路由 - 每次创建新连接
+// 聊天完成路由 - 修复流式输出问题
 router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
   let ws = null
   const requestId = uuidv4()
+  let isStreamMode = req.body.stream === true
   
   try {
-    console.log(`用户 ${req.account.username} 开始处理请求: ${requestId}`)
+    console.log(`用户 ${req.account.username} 开始处理请求: ${requestId}, 流式模式: ${isStreamMode}`)
     
-    const setHeader = () => {
-      try {
-        if (req.body.stream === true) {
-          res.setHeader('Content-Type', 'text/event-stream')
-          res.setHeader('Cache-Control', 'no-cache')
-          res.setHeader('Connection', 'keep-alive')
-        } else {
-          res.setHeader('Content-Type', 'application/json')
-        }
-      } catch (error) {
-        console.error("设置响应头时出错:", error)
-      }
+    // 首先设置响应头 - 这是关键修复点
+    if (isStreamMode) {
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+      res.setHeader('Cache-Control', 'no-cache')
+      res.setHeader('Connection', 'keep-alive')
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.setHeader('Access-Control-Allow-Headers', '*')
+      res.setHeader('X-Accel-Buffering', 'no') // 禁用 Nginx 缓冲
+      
+      // 立即刷新响应头
+      res.flushHeaders()
+    } else {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8')
     }
 
     // 创建新的WebSocket连接
@@ -433,9 +441,6 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
       ]
     }
 
-    // 设置响应头
-    setHeader()
-
     // 发送请求
     try {
       RequestID = await sentRequest(req, res)
@@ -445,6 +450,23 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
         ws.close()
       }
       return handleError(res, error, '发送请求失败')
+    }
+
+    // 发送初始流式数据块（仅在流式模式下）
+    if (isStreamMode) {
+      try {
+        const initialChunk = {
+          ...streamChunk,
+          choices: [{
+            index: 0,
+            delta: { role: "assistant" },
+            finish_reason: null
+          }]
+        }
+        res.write(`data: ${JSON.stringify(initialChunk)}\n\n`)
+      } catch (writeError) {
+        console.error('发送初始流式数据失败:', writeError)
+      }
     }
 
     // 消息处理函数
@@ -501,35 +523,56 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
             }
           }
 
-          if (req.body.stream === true && !res.headersSent) {
-            streamChunk.choices[0].delta.content = output
-            res.write(`data: ${JSON.stringify(streamChunk)}\n\n`)
+          // 流式输出处理 - 关键修复点
+          if (isStreamMode && output && !isCompleted) {
+            try {
+              streamChunk.choices[0].delta.content = output
+              const chunkData = `data: ${JSON.stringify(streamChunk)}\n\n`
+              res.write(chunkData)
+              console.log(`用户 ${req.account.username} 发送流式数据块: ${output.length} 字符`)
+            } catch (writeError) {
+              console.error('写入流式数据失败:', writeError)
+            }
           }
         }
         else if (ContentText?.name === "INDIVIDUAL_RUN_COMPLETE") {
-          if (isCompleted) return // 防止重复处理
+          if (isCompleted) return
           isCompleted = true
 
-          if (req.body.stream !== true) {
-            output = ThinkingLastContent ? `<think>\n\n${ThinkingLastContent}\n\n</think>\n\n${TextLastContent}` : TextLastContent
-          }
+          console.log(`用户 ${req.account.username} 请求完成`)
 
           // 检查是否为空回复或错误
           if (ThinkingLastContent === "" && TextLastContent === "") {
             if (ws && ws.readyState === WebSocket.OPEN) {
               ws.close()
             }
-            return res.status(502).json({
-              "error": {
-                "message": "上游服务返回空响应或发生错误",
-                "type": "upstream_error",
-                "param": null,
-                "code": "empty_response"
+            
+            if (isStreamMode) {
+              try {
+                res.write(`data: {"error": {"message": "上游服务返回空响应", "type": "upstream_error"}}\n\n`)
+                res.write(`data: [DONE]\n\n`)
+                res.end()
+              } catch (writeError) {
+                console.error('写入错误流式响应失败:', writeError)
+                res.end()
               }
-            })
+            } else {
+              return res.status(502).json({
+                "error": {
+                  "message": "上游服务返回空响应或发生错误",
+                  "type": "upstream_error",
+                  "param": null,
+                  "code": "empty_response"
+                }
+              })
+            }
+            return
           }
 
-          if (!req.body.stream || req.body.stream !== true) {
+          if (!isStreamMode) {
+            // 非流式响应
+            const output = ThinkingLastContent ? `<think>\n\n${ThinkingLastContent}\n\n</think>\n\n${TextLastContent}` : TextLastContent
+            
             let responseJson = {
               "id": MessageID,
               "object": "chat.completion",
@@ -563,24 +606,28 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
             return
           } else {
             // 流式响应：发送结束标记
-            let finalChunk = {
-              "id": MessageID,
-              "object": "chat.completion.chunk",
-              "system_fingerprint": "fp_44709d6fcb",
-              "created": Math.floor(Date.now() / 1000),
-              "model": req.body.model,
-              "choices": [
-                {
-                  "index": 0,
-                  "delta": {},
-                  "finish_reason": "stop"
-                }
-              ]
-            }
+            try {
+              let finalChunk = {
+                "id": MessageID,
+                "object": "chat.completion.chunk",
+                "system_fingerprint": "fp_44709d6fcb",
+                "created": Math.floor(Date.now() / 1000),
+                "model": req.body.model,
+                "choices": [
+                  {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                  }
+                ]
+              }
 
-            if (!res.headersSent) {
               res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
               res.write(`data: [DONE]\n\n`)
+              res.end()
+              console.log(`用户 ${req.account.username} 流式响应已完成`)
+            } catch (writeError) {
+              console.error('写入最终流式数据失败:', writeError)
               res.end()
             }
           }
@@ -607,6 +654,15 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
       
       if (!res.headersSent) {
         return handleError(res, error, 'WebSocket连接失败')
+      } else if (isStreamMode) {
+        try {
+          res.write(`data: {"error": {"message": "WebSocket连接失败", "type": "connection_error"}}\n\n`)
+          res.write(`data: [DONE]\n\n`)
+          res.end()
+        } catch (writeError) {
+          console.error('写入WebSocket错误响应失败:', writeError)
+          res.end()
+        }
       }
     }
 
@@ -632,6 +688,15 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
               "code": "request_timeout"
             }
           })
+        } else if (isStreamMode) {
+          try {
+            res.write(`data: {"error": {"message": "请求超时", "type": "timeout_error"}}\n\n`)
+            res.write(`data: [DONE]\n\n`)
+            res.end()
+          } catch (writeError) {
+            console.error('写入超时错误响应失败:', writeError)
+            res.end()
+          }
         }
       }
     }, 600000) // 10分钟超时
@@ -658,6 +723,15 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
     
     if (!res.headersSent) {
       return handleError(res, error, '聊天服务错误')
+    } else if (isStreamMode) {
+      try {
+        res.write(`data: {"error": {"message": "聊天服务错误", "type": "service_error"}}\n\n`)
+        res.write(`data: [DONE]\n\n`)
+        res.end()
+      } catch (writeError) {
+        console.error('写入服务错误响应失败:', writeError)
+        res.end()
+      }
     }
   }
 })
