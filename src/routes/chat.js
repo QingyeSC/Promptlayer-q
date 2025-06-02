@@ -1,4 +1,4 @@
-// 优化后的聊天路由，使用WebSocket连接池提升并发性能
+// 优化后的聊天路由，每次创建新的WebSocket连接
 
 const express = require('express')
 const axios = require('axios')
@@ -8,7 +8,6 @@ const { v4: uuidv4 } = require('uuid')
 const { uploadFileBuffer } = require('../lib/upload')
 const verify = require('./verify')
 const modelMap = require('../lib/model-map')
-const wsPool = require('../lib/websocket-pool')
 
 // 参数处理工具函数
 function processParameters(body) {
@@ -320,7 +319,55 @@ async function sentRequest(req, res) {
   }
 }
 
-// 优化后的聊天完成路由 - 使用连接池
+// 创建新的WebSocket连接
+function createWebSocketConnection(userAccount) {
+  return new Promise((resolve, reject) => {
+    const { ws_token, clientId } = userAccount
+    const wsUrl = `wss://realtime.ably.io/?access_token=${encodeURIComponent(ws_token)}&clientId=${clientId}&format=json&heartbeats=true&v=3&agent=ably-js%2F2.0.2%20browser`
+    
+    console.log(`用户 ${userAccount.username} 创建新的WebSocket连接`)
+    
+    const ws = new WebSocket(wsUrl)
+    const connectionId = `${clientId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+    
+    // 连接属性
+    ws.connectionId = connectionId
+    ws.userId = clientId
+    ws.createdAt = Date.now()
+
+    // 连接成功
+    ws.on('open', () => {
+      console.log(`用户 ${userAccount.username} WebSocket连接已建立: ${connectionId}`)
+      
+      // 发送初始连接消息
+      const sendAction = `{"action":10,"channel":"user:${clientId}","params":{"agent":"react-hooks/2.0.2"}}`
+      ws.send(sendAction)
+      
+      resolve(ws)
+    })
+
+    // 连接错误
+    ws.on('error', (error) => {
+      console.error(`用户 ${userAccount.username} WebSocket连接错误 ${connectionId}:`, error)
+      reject(error)
+    })
+
+    // 连接关闭
+    ws.on('close', () => {
+      console.log(`用户 ${userAccount.username} WebSocket连接已关闭: ${connectionId}`)
+    })
+
+    // 连接超时
+    setTimeout(() => {
+      if (ws.readyState === WebSocket.CONNECTING) {
+        ws.close()
+        reject(new Error('WebSocket连接超时'))
+      }
+    }, 10000) // 10秒连接超时
+  })
+}
+
+// 聊天完成路由 - 每次创建新连接
 router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
   let ws = null
   const requestId = uuidv4()
@@ -342,19 +389,21 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
       }
     }
 
-    // 从连接池获取WebSocket连接
+    // 创建新的WebSocket连接
     try {
-      ws = await wsPool.getConnection(req.account, requestId)
+      ws = await createWebSocketConnection(req.account)
     } catch (error) {
-      console.error(`用户 ${req.account.username} 获取WebSocket连接失败:`, error)
-      return handleError(res, error, '获取WebSocket连接失败')
+      console.error(`用户 ${req.account.username} 创建WebSocket连接失败:`, error)
+      return handleError(res, error, '创建WebSocket连接失败')
     }
 
     // 生成会话ID
     try {
       await getChatID(req, res)
     } catch (error) {
-      wsPool.releaseConnection(ws)
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close()
+      }
       return handleError(res, error, '获取会话ID失败')
     }
 
@@ -392,7 +441,9 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
       RequestID = await sentRequest(req, res)
       console.log(`用户 ${req.account.username} 发送请求成功，RequestID: ${RequestID}`)
     } catch (error) {
-      wsPool.releaseConnection(ws)
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close()
+      }
       return handleError(res, error, '发送请求失败')
     }
 
@@ -465,8 +516,9 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
 
           // 检查是否为空回复或错误
           if (ThinkingLastContent === "" && TextLastContent === "") {
-            ws.removeListener('message', messageHandler)
-            wsPool.releaseConnection(ws)
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.close()
+            }
             return res.status(502).json({
               "error": {
                 "message": "上游服务返回空响应或发生错误",
@@ -501,8 +553,9 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
               }
             }
 
-            ws.removeListener('message', messageHandler)
-            wsPool.releaseConnection(ws)
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.close()
+            }
             
             if (!res.headersSent) {
               res.json(responseJson)
@@ -532,8 +585,9 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
             }
           }
           
-          ws.removeListener('message', messageHandler)
-          wsPool.releaseConnection(ws)
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.close()
+          }
         }
 
       } catch (err) {
@@ -546,9 +600,10 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
     // 错误处理函数
     const errorHandler = (error) => {
       console.error(`用户 ${req.account.username} WebSocket连接错误:`, error)
-      ws.removeListener('message', messageHandler)
-      ws.removeListener('error', errorHandler)
-      wsPool.releaseConnection(ws)
+      
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close()
+      }
       
       if (!res.headersSent) {
         return handleError(res, error, 'WebSocket连接失败')
@@ -564,9 +619,9 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
       if (!isCompleted) {
         console.log(`用户 ${req.account.username} 请求超时: ${requestId}`)
         
-        ws.removeListener('message', messageHandler)
-        ws.removeListener('error', errorHandler)
-        wsPool.releaseConnection(ws)
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close()
+        }
         
         if (!res.headersSent) {
           res.status(504).json({
@@ -597,24 +652,14 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
   } catch (error) {
     console.error(`用户 ${req.account.username} 聊天处理错误:`, error)
     
-    if (ws) {
-      wsPool.releaseConnection(ws)
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.close()
     }
     
     if (!res.headersSent) {
       return handleError(res, error, '聊天服务错误')
     }
   }
-})
-
-// 添加连接池状态监控路由
-router.get('/v1/status/websocket-pool', (req, res) => {
-  const stats = wsPool.getStats()
-  res.json({
-    success: true,
-    timestamp: new Date().toISOString(),
-    websocket_pool: stats
-  })
 })
 
 module.exports = router
