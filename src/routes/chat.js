@@ -1,3 +1,5 @@
+// 优化后的聊天路由，使用WebSocket连接池提升并发性能
+
 const express = require('express')
 const axios = require('axios')
 const WebSocket = require('ws')
@@ -6,22 +8,20 @@ const { v4: uuidv4 } = require('uuid')
 const { uploadFileBuffer } = require('../lib/upload')
 const verify = require('./verify')
 const modelMap = require('../lib/model-map')
+const wsPool = require('../lib/websocket-pool')
 
-// 参数处理工具函数
+// 参数处理工具函数 (保持不变)
 function processParameters(body) {
   const processed = { ...body }
   
-  // 处理temperature参数：如果大于1或小于等于0或不存在，则随机取0.8-0.9之间的值
   if (!processed.temperature || processed.temperature <= 0 || processed.temperature > 1) {
-    processed.temperature = Math.round((Math.random() * 0.1 + 0.8) * 100) / 100 // 0.8-0.9之间，保留两位小数
+    processed.temperature = Math.round((Math.random() * 0.1 + 0.8) * 100) / 100
   }
   
-  // 处理top_p参数：如果大于1或小于等于0或不存在，则随机取0.8-0.9之间的值
   if (!processed.top_p || processed.top_p <= 0 || processed.top_p > 1) {
-    processed.top_p = Math.round((Math.random() * 0.1 + 0.8) * 100) / 100 // 0.8-0.9之间，保留两位小数
+    processed.top_p = Math.round((Math.random() * 0.1 + 0.8) * 100) / 100
   }
   
-  // 处理max_tokens参数：如果小于8192或大于16384或不存在，则默认16384
   if (!processed.max_tokens || processed.max_tokens < 8192 || processed.max_tokens > 16384) {
     processed.max_tokens = 16384
   }
@@ -29,20 +29,16 @@ function processParameters(body) {
   return processed
 }
 
-// 错误处理工具函数
+// 错误处理工具函数 (保持不变)
 function handleError(res, error, context = '服务器内部错误') {
   console.error(`${context}:`, error)
   
-  // 如果有响应状态码，使用原始状态码
   const statusCode = error.response?.status || 500
-  
-  // 尝试获取上游的原始错误信息
   let errorMessage = context
   let errorType = 'server_error'
   let errorCode = 'server_error'
   
   if (error.response?.data) {
-    // 如果上游返回了结构化的错误信息
     if (error.response.data.error) {
       errorMessage = error.response.data.error.message || error.response.data.error
       errorType = error.response.data.error.type || 'upstream_error'
@@ -60,7 +56,6 @@ function handleError(res, error, context = '服务器内部错误') {
     errorMessage = error.message
   }
   
-  // 根据状态码设置错误类型
   if (statusCode === 401) {
     errorType = 'authentication_error'
     errorCode = 'invalid_api_key'
@@ -85,6 +80,7 @@ function handleError(res, error, context = '服务器内部错误') {
   })
 }
 
+// 消息解析中间件 (保持不变)
 async function parseMessages(req, res, next) {
   const messages = req.body.messages
   if (!Array.isArray(messages)) {
@@ -171,139 +167,167 @@ async function parseMessages(req, res, next) {
   }
 }
 
+// 获取聊天ID (保持不变，但添加重试机制)
 async function getChatID(req, res) {
-  try {
-    const url = 'https://api.promptlayer.com/api/dashboard/v2/workspaces/' + req.account.workspaceId + '/playground_sessions'
-    const headers = { Authorization: "Bearer " + req.account.token }
-    const model_data = modelMap[req.body.model] ? modelMap[req.body.model] : modelMap["claude-3-7-sonnet-20250219"]
-    
-    // 处理请求参数
-    const processedBody = processParameters(req.body)
-    
-    let data = {
-      "id": uuidv4(),
-      "name": "Not implemented",
-      "prompt_blueprint": {
-        "inference_client_name": null,
-        "metadata": {
-          "model": { ...model_data }
+  const maxRetries = 3
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const url = 'https://api.promptlayer.com/api/dashboard/v2/workspaces/' + req.account.workspaceId + '/playground_sessions'
+      const headers = { Authorization: "Bearer " + req.account.token }
+      const model_data = modelMap[req.body.model] ? modelMap[req.body.model] : modelMap["claude-3-7-sonnet-20250219"]
+      
+      const processedBody = processParameters(req.body)
+      
+      let data = {
+        "id": uuidv4(),
+        "name": "Not implemented",
+        "prompt_blueprint": {
+          "inference_client_name": null,
+          "metadata": {
+            "model": { ...model_data }
+          },
+          "prompt_template": {
+            "type": "chat",
+            "messages": processedBody.messages,
+            "tools": processedBody.tools || null,
+            "tool_choice": processedBody.tool_choice || null,
+            "input_variables": [],
+            "functions": [],
+            "function_call": null
+          },
+          "provider_base_url_name": null
         },
-        "prompt_template": {
-          "type": "chat",
-          "messages": processedBody.messages,
-          "tools": processedBody.tools || null,
-          "tool_choice": processedBody.tool_choice || null,
-          "input_variables": [],
-          "functions": [],
-          "function_call": null
-        },
-        "provider_base_url_name": null
-      },
-      "input_variables": []
-    }
-
-    // 应用处理后的参数到模型配置
-    for (const item in processedBody) {
-      if (item === "messages" || item === "model" || item === "stream") {
-        continue
-      } else if (data.prompt_blueprint.metadata.model.parameters[item] !== undefined) {
-        if (item === "thinking" && processedBody[item].type === "disabled") { continue }
-        data.prompt_blueprint.metadata.model.parameters[item] = processedBody[item]
+        "input_variables": []
       }
-    }
 
-    // 如果模型有thinking参数，将budget_tokens设置为max_tokens的1/4
-    if (data.prompt_blueprint.metadata.model.parameters.thinking && 
-        data.prompt_blueprint.metadata.model.parameters.max_tokens) {
-      data.prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = 
-        Math.floor(data.prompt_blueprint.metadata.model.parameters.max_tokens / 4)
-    }
-    
-    console.log("模型参数 => ", data.prompt_blueprint.metadata.model)
-
-    const response = await axios.put(url, data, { headers })
-    if (response.data.success) {
-      console.log(`生成会话ID成功: ${response.data.playground_session.id}`)
-      req.chatID = response.data.playground_session.id
-      return response.data.playground_session.id
-    } else {
-      throw new Error(response.data.message || '获取会话ID失败')
-    }
-  } catch (error) {
-    console.error("获取会话ID失败:", error)
-    throw error
-  }
-}
-
-async function sentRequest(req, res) {
-  try {
-    const url = 'https://api.promptlayer.com/api/dashboard/v2/workspaces/' + req.account.workspaceId + '/run_groups'
-    const headers = { Authorization: "Bearer " + req.account.token }
-    const model_data = modelMap[req.body.model] ? modelMap[req.body.model] : modelMap["claude-3-7-sonnet-20250219"]
-    
-    // 处理请求参数
-    const processedBody = processParameters(req.body)
-    
-    let data = {
-      "id": uuidv4(),
-      "playground_session_id": req.chatID,
-      "shared_prompt_blueprint": {
-        "inference_client_name": null,
-        "metadata": {
-          "model": { ...model_data }
-        },
-        "prompt_template": {
-          "type": "chat",
-          "messages": processedBody.messages,
-          "tools": processedBody.tools || null,
-          "tool_choice": processedBody.tool_choice || null,
-          "input_variables": [],
-          "functions": [],
-          "function_call": null
-        },
-        "provider_base_url_name": null
-      },
-      "individual_run_requests": [
-        {
-          "input_variables": {},
-          "run_group_position": 1
+      for (const item in processedBody) {
+        if (item === "messages" || item === "model" || item === "stream") {
+          continue
+        } else if (data.prompt_blueprint.metadata.model.parameters[item] !== undefined) {
+          if (item === "thinking" && processedBody[item].type === "disabled") { continue }
+          data.prompt_blueprint.metadata.model.parameters[item] = processedBody[item]
         }
-      ]
-    }
-
-    // 应用处理后的参数到模型配置
-    for (const item in processedBody) {
-      if (item === "messages" || item === "model" || item === "stream") {
-        continue
-      } else if (data.shared_prompt_blueprint.metadata.model.parameters[item] !== undefined) {
-        if (item === "thinking" && processedBody[item].type === "disabled") continue
-        data.shared_prompt_blueprint.metadata.model.parameters[item] = processedBody[item]
       }
-    }
-    
-    // 如果模型有thinking参数，将budget_tokens设置为max_tokens的1/4
-    if (data.shared_prompt_blueprint.metadata.model.parameters.thinking && 
-        data.shared_prompt_blueprint.metadata.model.parameters.max_tokens) {
-      data.shared_prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = 
-        Math.floor(data.shared_prompt_blueprint.metadata.model.parameters.max_tokens / 4)
-    }
 
-    const response = await axios.post(url, data, { headers })
-    if (response.data.success) {
-      return response.data.run_group.individual_run_requests[0].id
-    } else {
-      throw new Error(response.data.message || '发送请求失败')
+      if (data.prompt_blueprint.metadata.model.parameters.thinking && 
+          data.prompt_blueprint.metadata.model.parameters.max_tokens) {
+        data.prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = 
+          Math.floor(data.prompt_blueprint.metadata.model.parameters.max_tokens / 4)
+      }
+      
+      console.log(`用户 ${req.account.username} 模型参数 =>`, data.prompt_blueprint.metadata.model)
+
+      const response = await axios.put(url, data, { 
+        headers,
+        timeout: 30000 // 30秒超时
+      })
+      
+      if (response.data.success) {
+        console.log(`用户 ${req.account.username} 生成会话ID成功: ${response.data.playground_session.id}`)
+        req.chatID = response.data.playground_session.id
+        return response.data.playground_session.id
+      } else {
+        throw new Error(response.data.message || '获取会话ID失败')
+      }
+    } catch (error) {
+      console.error(`获取会话ID失败 (尝试 ${attempt}/${maxRetries}):`, error.message)
+      
+      if (attempt === maxRetries) {
+        throw error
+      }
+      
+      // 指数退避重试
+      await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000))
     }
-  } catch (error) {
-    console.error("发送请求失败:", error)
-    throw error
   }
 }
 
-// 聊天完成路由
-router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
-  try {
+// 发送请求 (保持不变，但添加重试机制)
+async function sentRequest(req, res) {
+  const maxRetries = 3
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const url = 'https://api.promptlayer.com/api/dashboard/v2/workspaces/' + req.account.workspaceId + '/run_groups'
+      const headers = { Authorization: "Bearer " + req.account.token }
+      const model_data = modelMap[req.body.model] ? modelMap[req.body.model] : modelMap["claude-3-7-sonnet-20250219"]
+      
+      const processedBody = processParameters(req.body)
+      
+      let data = {
+        "id": uuidv4(),
+        "playground_session_id": req.chatID,
+        "shared_prompt_blueprint": {
+          "inference_client_name": null,
+          "metadata": {
+            "model": { ...model_data }
+          },
+          "prompt_template": {
+            "type": "chat",
+            "messages": processedBody.messages,
+            "tools": processedBody.tools || null,
+            "tool_choice": processedBody.tool_choice || null,
+            "input_variables": [],
+            "functions": [],
+            "function_call": null
+          },
+          "provider_base_url_name": null
+        },
+        "individual_run_requests": [
+          {
+            "input_variables": {},
+            "run_group_position": 1
+          }
+        ]
+      }
 
+      for (const item in processedBody) {
+        if (item === "messages" || item === "model" || item === "stream") {
+          continue
+        } else if (data.shared_prompt_blueprint.metadata.model.parameters[item] !== undefined) {
+          if (item === "thinking" && processedBody[item].type === "disabled") continue
+          data.shared_prompt_blueprint.metadata.model.parameters[item] = processedBody[item]
+        }
+      }
+      
+      if (data.shared_prompt_blueprint.metadata.model.parameters.thinking && 
+          data.shared_prompt_blueprint.metadata.model.parameters.max_tokens) {
+        data.shared_prompt_blueprint.metadata.model.parameters.thinking.budget_tokens = 
+          Math.floor(data.shared_prompt_blueprint.metadata.model.parameters.max_tokens / 4)
+      }
+
+      const response = await axios.post(url, data, { 
+        headers,
+        timeout: 30000 // 30秒超时
+      })
+      
+      if (response.data.success) {
+        return response.data.run_group.individual_run_requests[0].id
+      } else {
+        throw new Error(response.data.message || '发送请求失败')
+      }
+    } catch (error) {
+      console.error(`发送请求失败 (尝试 ${attempt}/${maxRetries}):`, error.message)
+      
+      if (attempt === maxRetries) {
+        throw error
+      }
+      
+      // 指数退避重试
+      await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 1000))
+    }
+  }
+}
+
+// 优化后的聊天完成路由 - 使用连接池
+router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
+  let ws = null
+  const requestId = uuidv4()
+  
+  try {
+    console.log(`用户 ${req.account.username} 开始处理请求: ${requestId}`)
+    
     const setHeader = () => {
       try {
         if (req.body.stream === true) {
@@ -318,29 +342,31 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
       }
     }
 
-    const { access_token, clientId } = req.account
-    
+    // 从连接池获取WebSocket连接
+    try {
+      ws = await wsPool.getConnection(req.account, requestId)
+    } catch (error) {
+      console.error(`用户 ${req.account.username} 获取WebSocket连接失败:`, error)
+      return handleError(res, error, '获取WebSocket连接失败')
+    }
+
     // 生成会话ID
     try {
       await getChatID(req, res)
     } catch (error) {
+      wsPool.releaseConnection(ws)
       return handleError(res, error, '获取会话ID失败')
     }
 
-    // 发送的数据
-    const sendAction = `{"action":10,"channel":"user:${clientId}","params":{"agent":"react-hooks/2.0.2"}}`
-    // 构建 WebSocket URL
-    const wsUrl = `wss://realtime.ably.io/?access_token=${encodeURIComponent(access_token)}&clientId=${clientId}&format=json&heartbeats=true&v=3&agent=ably-js%2F2.0.2%20browser`
-    // 创建 WebSocket 连接
-    const ws = new WebSocket(wsUrl)
-
-    // 状态详细
+    // 状态变量
     let ThinkingLastContent = ""
     let TextLastContent = ""
     let ThinkingStart = false
     let ThinkingEnd = false
     let RequestID = ""
     let MessageID = "chatcmpl-" + uuidv4()
+    let isCompleted = false
+    
     let streamChunk = {
       "id": MessageID,
       "object": "chat.completion.chunk",
@@ -358,24 +384,24 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
       ]
     }
 
-    ws.on('open', async () => {
-      try {
-        ws.send(sendAction)
-        RequestID = await sentRequest(req, res)
-        setHeader()
-      } catch (error) {
-        ws.close()
-        return handleError(res, error, '发送请求失败')
-      }
-    })
+    // 设置响应头
+    setHeader()
 
-    ws.on('message', async (data) => {
+    // 发送请求
+    try {
+      RequestID = await sentRequest(req, res)
+      console.log(`用户 ${req.account.username} 发送请求成功，RequestID: ${RequestID}`)
+    } catch (error) {
+      wsPool.releaseConnection(ws)
+      return handleError(res, error, '发送请求失败')
+    }
+
+    // 消息处理函数
+    const messageHandler = async (data) => {
       try {
         data = data.toString()
         
-        // 检查数据是否为空或无效
         if (!data || data === 'undefined' || data.trim() === '') {
-          console.log('收到空或无效的WebSocket消息，跳过处理')
           return
         }
         
@@ -383,7 +409,6 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
         try {
           parsedData = JSON.parse(data)
         } catch (parseError) {
-          console.log('WebSocket消息JSON解析失败，原始数据:', data)
           return
         }
         
@@ -396,7 +421,6 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
         try {
           ContentData = JSON.parse(ContentText.data)
         } catch (parseError) {
-          console.log('ContentText.data JSON解析失败:', ContentText.data)
           return
         }
         
@@ -408,7 +432,6 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
         if (ContentText?.name === "UPDATE_LAST_MESSAGE") {
           const MessageArray = ContentData?.payload?.message?.content
           for (const item of MessageArray) {
-
             if (item.type === "text") {
               output = item.text.replace(TextLastContent, "")
               if (ThinkingStart && !ThinkingEnd) {
@@ -425,16 +448,16 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
               }
               ThinkingLastContent = item.thinking
             }
-
           }
 
-          if (req.body.stream === true) {
+          if (req.body.stream === true && !res.headersSent) {
             streamChunk.choices[0].delta.content = output
             res.write(`data: ${JSON.stringify(streamChunk)}\n\n`)
           }
-
         }
         else if (ContentText?.name === "INDIVIDUAL_RUN_COMPLETE") {
+          if (isCompleted) return // 防止重复处理
+          isCompleted = true
 
           if (req.body.stream !== true) {
             output = ThinkingLastContent ? `<think>\n\n${ThinkingLastContent}\n\n</think>\n\n${TextLastContent}` : TextLastContent
@@ -442,8 +465,8 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
 
           // 检查是否为空回复或错误
           if (ThinkingLastContent === "" && TextLastContent === "") {
-            // 返回502错误，表示上游服务问题
-            ws.close()
+            ws.removeListener('message', messageHandler)
+            wsPool.releaseConnection(ws)
             return res.status(502).json({
               "error": {
                 "message": "上游服务返回空响应或发生错误",
@@ -478,8 +501,12 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
               }
             }
 
-            res.json(responseJson)
-            ws.close()
+            ws.removeListener('message', messageHandler)
+            wsPool.releaseConnection(ws)
+            
+            if (!res.headersSent) {
+              res.json(responseJson)
+            }
             return
           } else {
             // 流式响应：发送结束标记
@@ -498,31 +525,50 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
               ]
             }
 
-            res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
-            res.write(`data: [DONE]\n\n`)
-            res.end()
+            if (!res.headersSent) {
+              res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
+              res.write(`data: [DONE]\n\n`)
+              res.end()
+            }
           }
-          ws.close()
+          
+          ws.removeListener('message', messageHandler)
+          wsPool.releaseConnection(ws)
         }
 
       } catch (err) {
-        // 只记录非JSON解析错误
         if (!(err instanceof SyntaxError && err.message.includes('JSON'))) {
-          console.error("处理WebSocket消息出错:", err)
+          console.error(`用户 ${req.account.username} 处理WebSocket消息出错:`, err)
         }
       }
-    })
+    }
 
-    ws.on('error', (err) => {
-      console.error("WebSocket连接错误:", err)
-      return handleError(res, err, 'WebSocket连接失败')
-    })
+    // 错误处理函数
+    const errorHandler = (error) => {
+      console.error(`用户 ${req.account.username} WebSocket连接错误:`, error)
+      ws.removeListener('message', messageHandler)
+      ws.removeListener('error', errorHandler)
+      wsPool.releaseConnection(ws)
+      
+      if (!res.headersSent) {
+        return handleError(res, error, 'WebSocket连接失败')
+      }
+    }
 
-    setTimeout(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close()
+    // 绑定事件监听器
+    ws.on('message', messageHandler)
+    ws.on('error', errorHandler)
+
+    // 请求超时处理
+    const timeout = setTimeout(() => {
+      if (!isCompleted) {
+        console.log(`用户 ${req.account.username} 请求超时: ${requestId}`)
+        
+        ws.removeListener('message', messageHandler)
+        ws.removeListener('error', errorHandler)
+        wsPool.releaseConnection(ws)
+        
         if (!res.headersSent) {
-          // 返回504超时错误
           res.status(504).json({
             "error": {
               "message": "请求超时",
@@ -533,12 +579,42 @@ router.post('/v1/chat/completions', verify, parseMessages, async (req, res) => {
           })
         }
       }
-    }, 300 * 1000)
+    }, 600000) // 10分钟超时
+
+    // 请求完成时清理超时定时器
+    const originalEnd = res.end
+    res.end = function(...args) {
+      clearTimeout(timeout)
+      originalEnd.apply(this, args)
+    }
+
+    const originalJson = res.json
+    res.json = function(...args) {
+      clearTimeout(timeout)
+      originalJson.apply(this, args)
+    }
 
   } catch (error) {
-    console.error("聊天处理错误:", error)
-    return handleError(res, error, '聊天服务错误')
+    console.error(`用户 ${req.account.username} 聊天处理错误:`, error)
+    
+    if (ws) {
+      wsPool.releaseConnection(ws)
+    }
+    
+    if (!res.headersSent) {
+      return handleError(res, error, '聊天服务错误')
+    }
   }
+})
+
+// 添加连接池状态监控路由
+router.get('/v1/status/websocket-pool', (req, res) => {
+  const stats = wsPool.getStats()
+  res.json({
+    success: true,
+    timestamp: new Date().toISOString(),
+    websocket_pool: stats
+  })
 })
 
 module.exports = router
