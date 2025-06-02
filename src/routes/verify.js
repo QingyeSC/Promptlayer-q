@@ -92,7 +92,8 @@ const verify = async (req, res, next) => {
 // 验证 PromptLayer token 有效性并获取用户信息
 async function validatePromptLayerToken(token) {
   try {
-    const response = await axios.get('https://api.promptlayer.com/user', {
+    // 修正接口地址：从 /user 改为 /get-user
+    const response = await axios.get('https://api.promptlayer.com/get-user', {
       headers: {
         'Authorization': `Bearer ${token}`,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
